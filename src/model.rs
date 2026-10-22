@@ -12,7 +12,7 @@ const LAYERS: usize = 8;
 const KERNEL: usize = 5;
 const TOP_K: usize = 4;
 pub const VOCAB: usize = 256;
-pub const CONTEXT: usize = 16;
+pub const CONTEXT: usize = 24;
 
 type T = Tensor<Flex, 2>;
 
@@ -381,16 +381,20 @@ impl<'a> Atome<'a> {
         })
     }
 
-    pub fn cached_generation(&self) -> CachedGeneration<'_, 'a> {
-        CachedGeneration {
+    pub fn cached_generation(&self, max_tokens: usize) -> Result<CachedGeneration<'_, 'a>, Error> {
+        if max_tokens == 0 || max_tokens > CONTEXT {
+            return Err(Error::InvalidContext);
+        }
+        Ok(CachedGeneration {
             model: self,
-            states: (0..LAYERS).map(|_| BlockState::new()).collect(),
+            states: (0..LAYERS).map(|_| BlockState::new(max_tokens)).collect(),
             activation: None,
             next_layer: 0,
             tokens_seen: 0,
+            max_tokens,
             logits: [0.0; VOCAB],
             has_logits: false,
-        }
+        })
     }
 }
 
@@ -401,11 +405,11 @@ struct BlockState {
 }
 
 impl BlockState {
-    fn new() -> Self {
+    fn new(max_tokens: usize) -> Self {
         Self {
             conv_history: Vec::with_capacity(KERNEL - 1),
             ssm_hidden: alloc::vec![0.0; DIM],
-            kv: Vec::with_capacity(CONTEXT * (HEAD + DIM)),
+            kv: Vec::with_capacity(max_tokens * (HEAD + DIM)),
         }
     }
 }
@@ -416,6 +420,7 @@ pub struct CachedGeneration<'m, 'a> {
     activation: Option<Vec<f32>>,
     next_layer: usize,
     tokens_seen: usize,
+    max_tokens: usize,
     logits: [f32; VOCAB],
     has_logits: bool,
 }
@@ -425,7 +430,7 @@ impl CachedGeneration<'_, '_> {
         if self.activation.is_some() {
             return Err(Error::TokenInProgress);
         }
-        if self.tokens_seen >= CONTEXT {
+        if self.tokens_seen >= self.max_tokens {
             return Err(Error::InvalidContext);
         }
         self.activation = Some(
@@ -549,7 +554,9 @@ mod tests {
             model.start(b"A").unwrap().logits(),
             Err(Error::Incomplete)
         ));
-        let mut generation = model.cached_generation();
+        let mut generation = model.cached_generation(CONTEXT).unwrap();
+        assert!(model.cached_generation(0).is_err());
+        assert!(model.cached_generation(CONTEXT + 1).is_err());
         assert!(matches!(generation.step(), Err(Error::Incomplete)));
         generation.start_token(b'A').unwrap();
         assert!(matches!(

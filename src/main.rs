@@ -54,10 +54,12 @@ async fn inference_task() {
     let model = Atome::load(MODEL_BYTES).unwrap_or_else(|e| {
         defmt::panic!("Model load failed: {}", Debug2Format(&e));
     });
-    let prompt = b"Once upon a";
+    let prompt = b"Once upon a time, in";
     let mut tokens = [0u8; CONTEXT];
     tokens[..prompt.len()].copy_from_slice(prompt);
-    let mut generation = model.cached_generation();
+    let mut generation = model.cached_generation(CONTEXT).unwrap_or_else(|e| {
+        defmt::panic!("Invalid generation limit: {}", Debug2Format(&e));
+    });
     info!(
         "Burn Flex / cached Atome 944K: context={} heap={}",
         CONTEXT, HEAP_SIZE
@@ -68,17 +70,10 @@ async fn inference_task() {
         generation.start_token(token).unwrap_or_else(|e| {
             defmt::panic!("Invalid prompt token: {}", Debug2Format(&e));
         });
-        for layer in 0..8 {
-            let block_started = Instant::now();
-            let complete = generation.step().unwrap_or_else(|e| {
+        for _ in 0..8 {
+            generation.step().unwrap_or_else(|e| {
                 defmt::panic!("Cached block inference failed: {}", Debug2Format(&e));
             });
-            info!(
-                "Block {} complete={} us={}",
-                layer,
-                complete,
-                block_started.elapsed().as_micros()
-            );
             Timer::after_millis(1).await;
         }
         last_elapsed_us = started.elapsed().as_micros();
@@ -126,6 +121,13 @@ async fn inference_task() {
         "Generation complete: bytes={=[u8]}",
         &tokens[..prompt.len() + 4]
     );
+    match core::str::from_utf8(&tokens[..prompt.len() + 4]) {
+        Ok(text) => info!("Generated text: {}", defmt::Display2Format(text)),
+        Err(error) => error!(
+            "Output is not valid UTF-8: valid_up_to={}",
+            error.valid_up_to()
+        ),
+    }
 }
 
 #[embassy_executor::task]

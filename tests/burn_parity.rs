@@ -79,7 +79,7 @@ fn published_model_matches_numpy_with_bounded_allocations() {
         cases += 1;
     }
     assert_eq!(cases, 8);
-    assert_eq!(CONTEXT, 16);
+    assert_eq!(CONTEXT, 24);
     drop(model);
     let peak = PEAK.load(Ordering::SeqCst) - baseline;
     eprintln!("cases={cases} max_logit_error={max_error} peak_requested_heap={peak}");
@@ -89,7 +89,7 @@ fn published_model_matches_numpy_with_bounded_allocations() {
 #[test]
 fn cached_generation_matches_full_context_recomputation() {
     let model = Atome::load(MODEL_BYTES).unwrap();
-    let mut generation = model.cached_generation();
+    let mut generation = model.cached_generation(CONTEXT).unwrap();
     let mut tokens = b"Once upon a".to_vec();
     let mut max_error = 0.0f32;
     let mut cached_time = std::time::Duration::ZERO;
@@ -142,7 +142,7 @@ fn cached_generation_fits_in_reserved_heap() {
     let baseline = LIVE.load(Ordering::SeqCst);
     PEAK.store(baseline, Ordering::SeqCst);
     let model = Atome::load(MODEL_BYTES).unwrap();
-    let mut generation = model.cached_generation();
+    let mut generation = model.cached_generation(CONTEXT).unwrap();
     let mut tokens = b"Once upon a".to_vec();
     while tokens.len() < CONTEXT {
         generation.start_token(*tokens.last().unwrap()).unwrap();
