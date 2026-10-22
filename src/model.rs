@@ -12,6 +12,8 @@ const LAYERS: usize = 8;
 const KERNEL: usize = 5;
 const TOP_K: usize = 4;
 pub const VOCAB: usize = 256;
+/// Attention window: the full-context path accepts this many tokens and cached
+/// generation keeps this many K/V entries, evicting the oldest beyond it.
 pub const CONTEXT: usize = 24;
 
 type T = Tensor<Flex, 2>;
@@ -310,6 +312,10 @@ impl Block<'_> {
                 }
             }
         }
+        // Rolling window: the SSM state keeps older context, so only K/V is evicted.
+        if key_count == state.window {
+            state.kv.drain(..HEAD + DIM);
+        }
         state
             .kv
             .extend(key.iter().chain(&value).map(|&x| f16::from_f32(x)));
@@ -381,17 +387,15 @@ impl<'a> Atome<'a> {
         })
     }
 
-    pub fn cached_generation(&self, max_tokens: usize) -> Result<CachedGeneration<'_, 'a>, Error> {
-        if max_tokens == 0 || max_tokens > CONTEXT {
+    pub fn cached_generation(&self, window: usize) -> Result<CachedGeneration<'_, 'a>, Error> {
+        if window == 0 || window > CONTEXT {
             return Err(Error::InvalidContext);
         }
         Ok(CachedGeneration {
             model: self,
-            states: (0..LAYERS).map(|_| BlockState::new(max_tokens)).collect(),
+            states: (0..LAYERS).map(|_| BlockState::new(window)).collect(),
             activation: None,
             next_layer: 0,
-            tokens_seen: 0,
-            max_tokens,
             logits: [0.0; VOCAB],
             has_logits: false,
         })
@@ -399,17 +403,19 @@ impl<'a> Atome<'a> {
 }
 
 struct BlockState {
+    window: usize,
     conv_history: Vec<Vec<f32>>,
     ssm_hidden: Vec<f32>,
     kv: Vec<f16>,
 }
 
 impl BlockState {
-    fn new(max_tokens: usize) -> Self {
+    fn new(window: usize) -> Self {
         Self {
+            window,
             conv_history: Vec::with_capacity(KERNEL - 1),
             ssm_hidden: alloc::vec![0.0; DIM],
-            kv: Vec::with_capacity(max_tokens * (HEAD + DIM)),
+            kv: Vec::with_capacity(window * (HEAD + DIM)),
         }
     }
 }
@@ -419,8 +425,6 @@ pub struct CachedGeneration<'m, 'a> {
     states: Vec<BlockState>,
     activation: Option<Vec<f32>>,
     next_layer: usize,
-    tokens_seen: usize,
-    max_tokens: usize,
     logits: [f32; VOCAB],
     has_logits: bool,
 }
@@ -429,9 +433,6 @@ impl CachedGeneration<'_, '_> {
     pub fn start_token(&mut self, token: u8) -> Result<(), Error> {
         if self.activation.is_some() {
             return Err(Error::TokenInProgress);
-        }
-        if self.tokens_seen >= self.max_tokens {
-            return Err(Error::InvalidContext);
         }
         self.activation = Some(
             (0..DIM)
@@ -463,7 +464,6 @@ impl CachedGeneration<'_, '_> {
         if !self.logits.iter().all(|value| value.is_finite()) {
             return Err(Error::InvalidOutput);
         }
-        self.tokens_seen += 1;
         self.has_logits = true;
         Ok(true)
     }

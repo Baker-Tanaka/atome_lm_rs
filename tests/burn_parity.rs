@@ -130,7 +130,16 @@ fn cached_generation_matches_full_context_recomputation() {
         }
         cursor += 1;
     }
-    assert!(generation.start_token(0).is_err());
+    // Rolling window: generation continues past the window with finite logits.
+    for _ in 0..CONTEXT {
+        generation.start_token(b' ').unwrap();
+        for _ in 0..8 {
+            if generation.step().unwrap() {
+                break;
+            }
+        }
+        assert!(generation.logits().unwrap().iter().all(|v| v.is_finite()));
+    }
     assert_eq!(&tokens[11..15], b" tim");
     eprintln!(
         "cached max_logit_error={max_error} cached_cpu={cached_time:?} full_context_cpu={full_time:?}"
@@ -144,7 +153,7 @@ fn cached_generation_fits_in_reserved_heap() {
     let model = Atome::load(MODEL_BYTES).unwrap();
     let mut generation = model.cached_generation(CONTEXT).unwrap();
     let mut tokens = b"Once upon a".to_vec();
-    while tokens.len() < CONTEXT {
+    while tokens.len() < CONTEXT * 3 {
         generation.start_token(*tokens.last().unwrap()).unwrap();
         for _ in 0..8 {
             if generation.step().unwrap() {

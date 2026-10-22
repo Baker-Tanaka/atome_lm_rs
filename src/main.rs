@@ -1,7 +1,7 @@
 #![no_std]
 #![no_main]
 
-use atome_lm_rs::{Atome, CONTEXT, MODEL_BYTES};
+use atome_lm_rs::{Atome, CachedGeneration, CONTEXT, MODEL_BYTES};
 use core::{
     alloc::{GlobalAlloc, Layout},
     cell::Cell,
@@ -49,37 +49,48 @@ unsafe impl GlobalAlloc for Allocator {
     }
 }
 
+const PROMPT_MAX: usize = 32;
+const MAX_NEW: usize = 48;
+
+async fn process_token(generation: &mut CachedGeneration<'_, '_>, token: u8) {
+    generation.start_token(token).unwrap_or_else(|e| {
+        defmt::panic!("Invalid token: {}", Debug2Format(&e));
+    });
+    for _ in 0..8 {
+        generation.step().unwrap_or_else(|e| {
+            defmt::panic!("Cached block inference failed: {}", Debug2Format(&e));
+        });
+        Timer::after_millis(1).await;
+    }
+}
+
 #[embassy_executor::task]
 async fn inference_task() {
     let model = Atome::load(MODEL_BYTES).unwrap_or_else(|e| {
         defmt::panic!("Model load failed: {}", Debug2Format(&e));
     });
     let prompt = b"Once upon a time, in";
-    let mut tokens = [0u8; CONTEXT];
+    let mut tokens = [0u8; PROMPT_MAX + MAX_NEW];
     tokens[..prompt.len()].copy_from_slice(prompt);
     let mut generation = model.cached_generation(CONTEXT).unwrap_or_else(|e| {
-        defmt::panic!("Invalid generation limit: {}", Debug2Format(&e));
+        defmt::panic!("Invalid generation window: {}", Debug2Format(&e));
     });
     info!(
-        "Burn Flex / cached Atome 944K: context={} heap={}",
-        CONTEXT, HEAP_SIZE
+        "Burn Flex / cached Atome 944K: window={} max_new={} heap={}",
+        CONTEXT, MAX_NEW, HEAP_SIZE
     );
-    let mut last_elapsed_us = 0;
-    for (position, &token) in prompt.iter().enumerate() {
-        let started = Instant::now();
-        generation.start_token(token).unwrap_or_else(|e| {
-            defmt::panic!("Invalid prompt token: {}", Debug2Format(&e));
-        });
-        for _ in 0..8 {
-            generation.step().unwrap_or_else(|e| {
-                defmt::panic!("Cached block inference failed: {}", Debug2Format(&e));
-            });
-            Timer::after_millis(1).await;
-        }
-        last_elapsed_us = started.elapsed().as_micros();
-        info!("Prompt token {} processed us={}", position, last_elapsed_us);
+    let prefill_started = Instant::now();
+    for &token in prompt {
+        process_token(&mut generation, token).await;
     }
-    for index in 0..4 {
+    info!(
+        "Prefill: {} bytes in {} ms",
+        prompt.len(),
+        prefill_started.elapsed().as_millis()
+    );
+    let mut length = prompt.len();
+    let decode_started = Instant::now();
+    for index in 0..MAX_NEW {
         let logits = generation.logits().unwrap_or_else(|e| {
             defmt::panic!("Cached inference logits unavailable: {}", Debug2Format(&e));
         });
@@ -89,39 +100,28 @@ async fn inference_task() {
                 next = i;
             }
         }
-        tokens[prompt.len() + index] = next as u8;
-        let peak = critical_section::with(|cs| HEAP_PEAK.borrow(cs).get());
-        let used = HEAP.used();
-        info!(
-            "TOK {} id={} us={} heap_used={} heap_peak={}",
-            index, next, last_elapsed_us, used, peak
-        );
-        if index < 3 {
-            let started = Instant::now();
-            generation.start_token(next as u8).unwrap_or_else(|e| {
-                defmt::panic!("Invalid generated token: {}", Debug2Format(&e));
-            });
-            for layer in 0..8 {
-                let block_started = Instant::now();
-                let complete = generation.step().unwrap_or_else(|e| {
-                    defmt::panic!("Cached block inference failed: {}", Debug2Format(&e));
-                });
-                info!(
-                    "Block {} complete={} us={}",
-                    layer,
-                    complete,
-                    block_started.elapsed().as_micros()
-                );
-                Timer::after_millis(1).await;
-            }
-            last_elapsed_us = started.elapsed().as_micros();
+        tokens[length] = next as u8;
+        length += 1;
+        if matches!(next as u8, b'.' | b'!' | b'?' | b'\n') {
+            info!("Stopped at sentence end after {} tokens", index + 1);
+            break;
+        }
+        if index + 1 == MAX_NEW {
+            break;
+        }
+        process_token(&mut generation, next as u8).await;
+        if (index + 1) % 8 == 0 {
+            info!(
+                "{} tokens, {} ms/token",
+                index + 1,
+                decode_started.elapsed().as_millis() / (index as u64 + 1)
+            );
         }
     }
-    info!(
-        "Generation complete: bytes={=[u8]}",
-        &tokens[..prompt.len() + 4]
-    );
-    match core::str::from_utf8(&tokens[..prompt.len() + 4]) {
+    let peak = critical_section::with(|cs| HEAP_PEAK.borrow(cs).get());
+    info!("Heap: used={} peak={}", HEAP.used(), peak);
+    info!("Generation complete: bytes={=[u8]}", &tokens[..length]);
+    match core::str::from_utf8(&tokens[..length]) {
         Ok(text) => info!("Generated text: {}", defmt::Display2Format(text)),
         Err(error) => error!(
             "Output is not valid UTF-8: valid_up_to={}",
