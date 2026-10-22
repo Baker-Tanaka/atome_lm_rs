@@ -18,6 +18,8 @@ RUN cargo install flip-link --version 0.1.12 --locked \
 	&& cargo install cargo-binutils --locked \
 	&& cargo install elf2uf2-rs --locked
 
+RUN curl -LsSf https://astral.sh/uv/install.sh | sh
+
 USER root
 RUN chgrp -R rustlang ${CARGO_HOME} ${RUSTUP_HOME} \
 	&& chmod -R g+rwX ${CARGO_HOME} ${RUSTUP_HOME}
