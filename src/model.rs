@@ -4,6 +4,7 @@ use burn::{
     tensor::{activation::softmax, Bool, IndexingUpdateOp, Tensor, TensorData},
 };
 use burn_flex::FlexDevice;
+use half::f16;
 
 const DIM: usize = 256;
 const HEAD: usize = 64;
@@ -23,6 +24,7 @@ pub enum Error {
     InvalidContext,
     Incomplete,
     InvalidOutput,
+    TokenInProgress,
 }
 
 struct Reader<'a> {
@@ -105,32 +107,57 @@ impl Matrix<'_> {
         }
     }
 
-    fn project(&self, input: T) -> T {
+    fn project(&self, input: T) -> Result<T, Error> {
         let [seq, _] = input.dims();
-        let mut output = T::zeros([seq, self.rows], &FlexDevice);
-        // Flex's GEMM scratch exceeds RP2040 SRAM. Burn broadcast/reduce avoids it.
+        let input = tensor_values(input)?;
+        Ok(tensor(self.project_values(&input, seq), [seq, self.rows]))
+    }
+
+    fn project_values(&self, input: &[f32], seq: usize) -> Vec<f32> {
+        let mut output = alloc::vec![0.0; seq * self.rows];
         for row in 0..self.rows {
-            let weights = tensor(
-                (0..self.cols).map(|col| self.weight(row, col)).collect(),
-                [1, self.cols],
-            );
-            let projected = (input.clone() * weights).sum_dim(1);
-            output = output.slice_assign([0..seq, row..row + 1], projected);
+            let row_offset = row * self.cols;
+            for position in 0..seq {
+                let input_offset = position * self.cols;
+                let mut sum = 0.0f32;
+                for col in 0..self.cols {
+                    let index = row_offset + col;
+                    match (self.packed[index / 4] >> ((index % 4) * 2)) & 3 {
+                        1 => sum += input[input_offset + col],
+                        3 => sum -= input[input_offset + col],
+                        _ => {}
+                    }
+                }
+                output[position * self.rows + row] = sum * self.scale;
+            }
         }
         output
     }
 }
 
-fn bounded_matmul(lhs: T, rhs: T) -> T {
-    let [seq, inner] = lhs.dims();
+fn tensor_values(tensor: T) -> Result<Vec<f32>, Error> {
+    let data = tensor.into_data();
+    data.as_slice::<f32>()
+        .map(alloc::borrow::ToOwned::to_owned)
+        .map_err(|_| Error::InvalidOutput)
+}
+
+fn bounded_matmul(lhs: T, rhs: T) -> Result<T, Error> {
+    let [rows, inner] = lhs.dims();
     let [_, cols] = rhs.dims();
-    let mut output = T::zeros([seq, cols], &FlexDevice);
-    for col in 0..cols {
-        let column = rhs.clone().slice([0..inner, col..col + 1]).transpose();
-        let product = (lhs.clone() * column).sum_dim(1);
-        output = output.slice_assign([0..seq, col..col + 1], product);
+    let lhs = tensor_values(lhs)?;
+    let rhs = tensor_values(rhs)?;
+    let mut output = alloc::vec![0.0; rows * cols];
+    for row in 0..rows {
+        for col in 0..cols {
+            let mut sum = 0.0f32;
+            for k in 0..inner {
+                sum += lhs[row * inner + k] * rhs[k * cols + col];
+            }
+            output[row * cols + col] = sum;
+        }
     }
-    output
+    Ok(tensor(output, [rows, cols]))
 }
 
 struct Norm<'a> {
@@ -139,10 +166,10 @@ struct Norm<'a> {
 }
 
 impl Norm<'_> {
-    fn forward(&self, input: T) -> T {
+    fn forward(&self, input: T) -> Result<T, Error> {
         let centered = input.clone() - input.mean_dim(1);
         let variance = (centered.clone() * centered.clone()).mean_dim(1);
-        centered / (variance + 1.0e-5).sqrt() * vector(self.gamma) + vector(self.beta)
+        Ok(centered / (variance + 1.0e-5).sqrt() * vector(self.gamma) + vector(self.beta))
     }
 }
 
@@ -188,12 +215,12 @@ impl Block<'_> {
         output
     }
 
-    fn sparse(&self, input: T) -> T {
+    fn sparse(&self, input: T) -> Result<T, Error> {
         let [seq, _] = input.dims();
-        let q = self.query.project(input.clone());
-        let k = self.key.project(input.clone());
-        let v = self.value.project(input);
-        let scores = bounded_matmul(q, k.transpose()) / 8.0; // sqrt(HEAD) = 8
+        let q = self.query.project(input.clone())?;
+        let k = self.key.project(input.clone())?;
+        let v = self.value.project(input)?;
+        let scores = bounded_matmul(q, k.transpose())? / 8.0; // sqrt(HEAD) = 8
         let mask: Vec<bool> = (0..seq)
             .flat_map(|row| (0..seq).map(move |col| col > row))
             .collect();
@@ -211,15 +238,89 @@ impl Block<'_> {
         bounded_matmul(attention, v)
     }
 
-    fn forward(&self, input: T) -> T {
+    fn forward(&self, input: T) -> Result<T, Error> {
         let [seq, _] = input.dims();
-        let h = self.norm.forward(input.clone());
-        let routes = softmax(self.router.project(h.clone()), 1);
+        let h = self.norm.forward(input.clone())?;
+        let routes = softmax(self.router.project(h.clone())?, 1);
         // Accumulate pathways one at a time to avoid retaining all three outputs.
         let mixed = self.local(h.clone()) * routes.clone().slice([0..seq, 0..1]);
         let mixed = mixed + self.state(h.clone()) * routes.clone().slice([0..seq, 1..2]);
-        let mixed = mixed + self.sparse(h) * routes.slice([0..seq, 2..3]);
-        input + mixed
+        let mixed = mixed + self.sparse(h)? * routes.slice([0..seq, 2..3]);
+        Ok(input + mixed)
+    }
+
+    fn forward_cached(&self, input: &[f32], state: &mut BlockState) -> Result<Vec<f32>, Error> {
+        let h = tensor_values(self.norm.forward(tensor(input.to_vec(), [1, DIM]))?)?;
+        let route_logits = self.router.project_values(&h, 1);
+        let routes = tensor_values(softmax(tensor(route_logits, [1, 3]), 1))?;
+        let mut mixed = alloc::vec![0.0; DIM];
+
+        for channel in 0..DIM {
+            let mut local = self.conv.weight(channel, 0) * h[channel];
+            for lag in 1..KERNEL.min(state.conv_history.len() + 1) {
+                let previous = &state.conv_history[state.conv_history.len() - lag];
+                local += self.conv.weight(channel, lag) * previous[channel];
+            }
+            mixed[channel] = routes[0] * local;
+        }
+
+        for channel in 0..DIM {
+            let decay = libm::tanhf(read_float(&self.a[channel * 4..channel * 4 + 4]));
+            state.ssm_hidden[channel] = decay * state.ssm_hidden[channel]
+                + read_float(&self.b[channel * 4..channel * 4 + 4]) * h[channel];
+            let output =
+                read_float(&self.c[channel * 4..channel * 4 + 4]) * state.ssm_hidden[channel];
+            mixed[channel] += routes[1] * output;
+        }
+
+        let query = self.query.project_values(&h, 1);
+        let key = self.key.project_values(&h, 1);
+        let value = self.value.project_values(&h, 1);
+        let key_count = state.kv.len() / (HEAD + DIM);
+        let mut scores = Vec::with_capacity(key_count + 1);
+        for position in 0..key_count {
+            let offset = position * (HEAD + DIM);
+            let mut score = 0.0;
+            for channel in 0..HEAD {
+                score += query[channel] * state.kv[offset + channel].to_f32();
+            }
+            scores.push(score / 8.0);
+        }
+        let mut score = 0.0;
+        for channel in 0..HEAD {
+            score += query[channel] * key[channel];
+        }
+        scores.push(score / 8.0);
+
+        let mut selected: Vec<usize> = (0..scores.len()).collect();
+        selected.sort_by(|&left, &right| scores[right].total_cmp(&scores[left]));
+        selected.truncate(TOP_K.min(scores.len()));
+        let selected_scores: Vec<f32> = selected.iter().map(|&i| scores[i]).collect();
+        let probabilities =
+            tensor_values(softmax(tensor(selected_scores, [1, selected.len()]), 1))?;
+        for (&position, &probability) in selected.iter().zip(&probabilities) {
+            if position == key_count {
+                for channel in 0..DIM {
+                    mixed[channel] += routes[2] * probability * value[channel];
+                }
+            } else {
+                let offset = position * (HEAD + DIM) + HEAD;
+                for channel in 0..DIM {
+                    mixed[channel] += routes[2] * probability * state.kv[offset + channel].to_f32();
+                }
+            }
+        }
+        state
+            .kv
+            .extend(key.iter().chain(&value).map(|&x| f16::from_f32(x)));
+        state.conv_history.push(h);
+        if state.conv_history.len() >= KERNEL {
+            state.conv_history.remove(0);
+        }
+        for channel in 0..DIM {
+            mixed[channel] += input[channel];
+        }
+        Ok(mixed)
     }
 }
 
@@ -279,6 +380,95 @@ impl<'a> Atome<'a> {
             next_layer: 0,
         })
     }
+
+    pub fn cached_generation(&self) -> CachedGeneration<'_, 'a> {
+        CachedGeneration {
+            model: self,
+            states: (0..LAYERS).map(|_| BlockState::new()).collect(),
+            activation: None,
+            next_layer: 0,
+            tokens_seen: 0,
+            logits: [0.0; VOCAB],
+            has_logits: false,
+        }
+    }
+}
+
+struct BlockState {
+    conv_history: Vec<Vec<f32>>,
+    ssm_hidden: Vec<f32>,
+    kv: Vec<f16>,
+}
+
+impl BlockState {
+    fn new() -> Self {
+        Self {
+            conv_history: Vec::with_capacity(KERNEL - 1),
+            ssm_hidden: alloc::vec![0.0; DIM],
+            kv: Vec::with_capacity(CONTEXT * (HEAD + DIM)),
+        }
+    }
+}
+
+pub struct CachedGeneration<'m, 'a> {
+    model: &'m Atome<'a>,
+    states: Vec<BlockState>,
+    activation: Option<Vec<f32>>,
+    next_layer: usize,
+    tokens_seen: usize,
+    logits: [f32; VOCAB],
+    has_logits: bool,
+}
+
+impl CachedGeneration<'_, '_> {
+    pub fn start_token(&mut self, token: u8) -> Result<(), Error> {
+        if self.activation.is_some() {
+            return Err(Error::TokenInProgress);
+        }
+        if self.tokens_seen >= CONTEXT {
+            return Err(Error::InvalidContext);
+        }
+        self.activation = Some(
+            (0..DIM)
+                .map(|channel| self.model.embed.weight(token as usize, channel))
+                .collect(),
+        );
+        self.next_layer = 0;
+        self.has_logits = false;
+        Ok(())
+    }
+
+    pub fn step(&mut self) -> Result<bool, Error> {
+        let input = self.activation.take().ok_or(Error::Incomplete)?;
+        let output = self.model.blocks[self.next_layer]
+            .forward_cached(&input, &mut self.states[self.next_layer])?;
+        self.next_layer += 1;
+        if self.next_layer < LAYERS {
+            self.activation = Some(output);
+            return Ok(false);
+        }
+
+        let normalized = tensor_values(self.model.final_norm.forward(tensor(output, [1, DIM]))?)?;
+        self.logits = self
+            .model
+            .unembed
+            .project_values(&normalized, 1)
+            .try_into()
+            .map_err(|_| Error::InvalidOutput)?;
+        if !self.logits.iter().all(|value| value.is_finite()) {
+            return Err(Error::InvalidOutput);
+        }
+        self.tokens_seen += 1;
+        self.has_logits = true;
+        Ok(true)
+    }
+
+    pub fn logits(&self) -> Result<&[f32; VOCAB], Error> {
+        if !self.has_logits || self.activation.is_some() {
+            return Err(Error::Incomplete);
+        }
+        Ok(&self.logits)
+    }
 }
 
 /// A full-window inference, advanced one block at a time for cooperative scheduling.
@@ -290,12 +480,12 @@ pub struct Inference<'m, 'a> {
 
 impl Inference<'_, '_> {
     /// Returns true when all blocks are complete. No state is carried between windows.
-    pub fn step(&mut self) -> bool {
+    pub fn step(&mut self) -> Result<bool, Error> {
         if self.next_layer < LAYERS {
-            self.x = self.model.blocks[self.next_layer].forward(self.x.clone());
+            self.x = self.model.blocks[self.next_layer].forward(self.x.clone())?;
             self.next_layer += 1;
         }
-        self.next_layer == LAYERS
+        Ok(self.next_layer == LAYERS)
     }
 
     pub fn logits(self) -> Result<[f32; VOCAB], Error> {
@@ -304,8 +494,8 @@ impl Inference<'_, '_> {
         }
         let [seq, _] = self.x.dims();
         let last = self.x.slice([seq - 1..seq, 0..DIM]);
-        let last = self.model.final_norm.forward(last);
-        let data = self.model.unembed.project(last).into_data();
+        let last = self.model.final_norm.forward(last)?;
+        let data = self.model.unembed.project(last)?.into_data();
         let values = data.as_slice::<f32>().map_err(|_| Error::InvalidOutput)?;
         let logits: [f32; VOCAB] = values.try_into().map_err(|_| Error::InvalidOutput)?;
         if !logits.iter().all(|x| x.is_finite()) {
@@ -359,10 +549,17 @@ mod tests {
             model.start(b"A").unwrap().logits(),
             Err(Error::Incomplete)
         ));
+        let mut generation = model.cached_generation();
+        assert!(matches!(generation.step(), Err(Error::Incomplete)));
+        generation.start_token(b'A').unwrap();
+        assert!(matches!(
+            generation.start_token(b'B'),
+            Err(Error::TokenInProgress)
+        ));
     }
 
     #[test]
-    fn tiled_projection_matches_dense_burn_matmul() {
+    fn packed_projection_matches_dense_burn_matmul() {
         let packed = [0b11_01_00_01; 15];
         let m = Matrix {
             packed: &packed,
@@ -376,7 +573,7 @@ mod tests {
             .map(|(r, c)| m.weight(r, c))
             .collect();
         let expected = input.clone().matmul(tensor(weights, [5, 12])).into_data();
-        let actual = m.project(input).into_data();
+        let actual = m.project(input).unwrap().into_data();
         for (a, b) in actual
             .as_slice::<f32>()
             .unwrap()

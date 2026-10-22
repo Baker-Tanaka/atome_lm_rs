@@ -19,6 +19,8 @@ embassy = [
 [dependencies]
 burn = { version = "=0.21.0", default-features = false, features = ["flex"] }
 burn-flex = { version = "=0.21.0", default-features = false, features = ["critical-section"] }
+half = { version = "2.7.1", default-features = false, features = ["alloc"] }
+libm = "0.2.15"
 
 [target.'cfg(all(target_arch = "arm", target_os = "none"))'.dependencies]
 embedded-alloc = "0.6"

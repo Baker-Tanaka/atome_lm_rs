@@ -46,13 +46,13 @@ fn published_model_matches_numpy_with_bounded_allocations() {
         let mut layers = 0;
         loop {
             layers += 1;
-            if inference.step() {
+            if inference.step().unwrap() {
                 break;
             }
             assert!(layers < 8);
         }
         assert_eq!(layers, 8);
-        assert!(inference.step());
+        assert!(inference.step().unwrap());
         let actual = inference.logits().unwrap();
         let expected: Vec<f32> = expected
             .chunks_exact(4)
@@ -84,4 +84,89 @@ fn published_model_matches_numpy_with_bounded_allocations() {
     let peak = PEAK.load(Ordering::SeqCst) - baseline;
     eprintln!("cases={cases} max_logit_error={max_error} peak_requested_heap={peak}");
     assert!(peak < 192 * 1024, "peak requested heap: {peak}");
+}
+
+#[test]
+fn cached_generation_matches_full_context_recomputation() {
+    let model = Atome::load(MODEL_BYTES).unwrap();
+    let mut generation = model.cached_generation();
+    let mut tokens = b"Once upon a".to_vec();
+    let mut max_error = 0.0f32;
+    let mut cached_time = std::time::Duration::ZERO;
+    let mut full_time = std::time::Duration::ZERO;
+    let mut cursor = 0;
+    while cursor < CONTEXT {
+        let token = tokens[cursor];
+        generation.start_token(token).unwrap();
+        let started = std::time::Instant::now();
+        for _ in 0..8 {
+            if generation.step().unwrap() {
+                break;
+            }
+        }
+        cached_time += started.elapsed();
+        let cached = generation.logits().unwrap();
+        let mut full = model.start(&tokens[..=cursor]).unwrap();
+        let started = std::time::Instant::now();
+        while !full.step().unwrap() {}
+        full_time += started.elapsed();
+        let full = full.logits().unwrap();
+        for (&actual, &expected) in cached.iter().zip(&full) {
+            max_error = max_error.max((actual - expected).abs());
+        }
+        let cached_next = argmax(cached);
+        let full_next = argmax(&full);
+        assert_eq!(cached_next, full_next, "tokens={:?}", &tokens[..=cursor]);
+        assert!(
+            cached
+                .iter()
+                .zip(&full)
+                .all(|(&a, &b)| (a - b).abs() <= 2.0e-2 + 2.0e-3 * b.abs()),
+            "cached logits drifted for tokens={:?}",
+            &tokens[..=cursor]
+        );
+        if cursor + 1 == tokens.len() && cursor + 1 < CONTEXT {
+            tokens.push(cached_next as u8);
+        }
+        cursor += 1;
+    }
+    assert!(generation.start_token(0).is_err());
+    assert_eq!(&tokens[11..15], b" tim");
+    eprintln!(
+        "cached max_logit_error={max_error} cached_cpu={cached_time:?} full_context_cpu={full_time:?}"
+    );
+}
+
+#[test]
+fn cached_generation_fits_in_reserved_heap() {
+    let baseline = LIVE.load(Ordering::SeqCst);
+    PEAK.store(baseline, Ordering::SeqCst);
+    let model = Atome::load(MODEL_BYTES).unwrap();
+    let mut generation = model.cached_generation();
+    let mut tokens = b"Once upon a".to_vec();
+    while tokens.len() < CONTEXT {
+        generation.start_token(*tokens.last().unwrap()).unwrap();
+        for _ in 0..8 {
+            if generation.step().unwrap() {
+                break;
+            }
+        }
+        let next = argmax(generation.logits().unwrap());
+        tokens.push(next as u8);
+    }
+    drop(generation);
+    drop(model);
+    let peak = PEAK.load(Ordering::SeqCst) - baseline;
+    eprintln!("cached inference peak_requested_heap={peak}");
+    assert!(peak < 192 * 1024, "cached peak requested heap: {peak}");
+}
+
+fn argmax(values: &[f32]) -> usize {
+    let mut best = 0;
+    for i in 1..values.len() {
+        if values[i] > values[best] {
+            best = i;
+        }
+    }
+    best
 }

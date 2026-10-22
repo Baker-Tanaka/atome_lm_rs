@@ -57,23 +57,36 @@ async fn inference_task() {
     let prompt = b"Once upon a";
     let mut tokens = [0u8; CONTEXT];
     tokens[..prompt.len()].copy_from_slice(prompt);
-    let mut len = prompt.len();
+    let mut generation = model.cached_generation();
     info!(
-        "Burn Flex / Atome 944K: context={} heap={}",
+        "Burn Flex / cached Atome 944K: context={} heap={}",
         CONTEXT, HEAP_SIZE
     );
-    for index in 0..4 {
+    let mut last_elapsed_us = 0;
+    for (position, &token) in prompt.iter().enumerate() {
         let started = Instant::now();
-        let mut inference = model.start(&tokens[..len]).unwrap_or_else(|e| {
-            defmt::panic!("Invalid inference input: {}", Debug2Format(&e));
+        generation.start_token(token).unwrap_or_else(|e| {
+            defmt::panic!("Invalid prompt token: {}", Debug2Format(&e));
         });
         for layer in 0..8 {
-            let complete = inference.step();
-            info!("Block {} complete={}", layer, complete);
+            let block_started = Instant::now();
+            let complete = generation.step().unwrap_or_else(|e| {
+                defmt::panic!("Cached block inference failed: {}", Debug2Format(&e));
+            });
+            info!(
+                "Block {} complete={} us={}",
+                layer,
+                complete,
+                block_started.elapsed().as_micros()
+            );
             Timer::after_millis(1).await;
         }
-        let logits = inference.logits().unwrap_or_else(|e| {
-            defmt::panic!("Inference failed: {}", Debug2Format(&e));
+        last_elapsed_us = started.elapsed().as_micros();
+        info!("Prompt token {} processed us={}", position, last_elapsed_us);
+    }
+    for index in 0..4 {
+        let logits = generation.logits().unwrap_or_else(|e| {
+            defmt::panic!("Cached inference logits unavailable: {}", Debug2Format(&e));
         });
         let mut next = 0;
         for i in 1..logits.len() {
@@ -81,18 +94,38 @@ async fn inference_task() {
                 next = i;
             }
         }
-        tokens[len] = next as u8;
-        len += 1;
+        tokens[prompt.len() + index] = next as u8;
         let peak = critical_section::with(|cs| HEAP_PEAK.borrow(cs).get());
+        let used = HEAP.used();
         info!(
-            "TOK {} id={} us={} heap_peak={}",
-            index,
-            next,
-            started.elapsed().as_micros(),
-            peak
+            "TOK {} id={} us={} heap_used={} heap_peak={}",
+            index, next, last_elapsed_us, used, peak
         );
+        if index < 3 {
+            let started = Instant::now();
+            generation.start_token(next as u8).unwrap_or_else(|e| {
+                defmt::panic!("Invalid generated token: {}", Debug2Format(&e));
+            });
+            for layer in 0..8 {
+                let block_started = Instant::now();
+                let complete = generation.step().unwrap_or_else(|e| {
+                    defmt::panic!("Cached block inference failed: {}", Debug2Format(&e));
+                });
+                info!(
+                    "Block {} complete={} us={}",
+                    layer,
+                    complete,
+                    block_started.elapsed().as_micros()
+                );
+                Timer::after_millis(1).await;
+            }
+            last_elapsed_us = started.elapsed().as_micros();
+        }
     }
-    info!("Generation complete: bytes={=[u8]}", &tokens[..len]);
+    info!(
+        "Generation complete: bytes={=[u8]}",
+        &tokens[..prompt.len() + 4]
+    );
 }
 
 #[embassy_executor::task]
