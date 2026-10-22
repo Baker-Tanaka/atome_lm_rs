@@ -1,0 +1,4 @@
+[toolchain]
+channel = "1.94.1"
+targets = ["thumbv6m-none-eabi"]
+components = ["rustfmt", "llvm-tools"]

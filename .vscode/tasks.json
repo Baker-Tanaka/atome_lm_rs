@@ -1,0 +1,110 @@
+{
+    "version": "2.0.0",
+    "tasks": [
+        {
+            "label": "cargo: build",
+            "type": "shell",
+            "command": "cargo build",
+            "group": {
+                "kind": "build",
+                "isDefault": true
+            },
+            "problemMatcher": ["$rustc"]
+        },
+        {
+            "label": "cargo: build (release)",
+            "type": "shell",
+            "command": "cargo build --release",
+            "group": "build",
+            "problemMatcher": ["$rustc"]
+        },
+        {
+            "label": "cargo: build embassy example",
+            "type": "shell",
+            "command": "cargo build --no-default-features --features embassy --example ${input:embassyExample}",
+            "group": "build",
+            "problemMatcher": ["$rustc"]
+        },
+        {
+            "label": "cargo: check",
+            "type": "shell",
+            "command": "cargo check",
+            "group": "build",
+            "problemMatcher": ["$rustc"]
+        },
+        {
+            "label": "cargo fmt: format code",
+            "type": "shell",
+            "command": "cargo fmt",
+            "problemMatcher": []
+        },
+        {
+            "label": "cargo fmt: check format",
+            "type": "shell",
+            "command": "cargo fmt -- --check",
+            "problemMatcher": []
+        },
+        {
+            "label": "cargo size: show binary size",
+            "type": "shell",
+            "command": "cargo size --release -- -A",
+            "problemMatcher": []
+        },
+        {
+            "label": "cargo objdump: disassemble",
+            "type": "shell",
+            "command": "cargo objdump --release -- --disassemble",
+            "problemMatcher": []
+        },
+        {
+            "label": "cargo objdump: section headers",
+            "type": "shell",
+            "command": "cargo objdump --release -- --section-headers",
+            "problemMatcher": []
+        },
+        {
+            "label": "cargo objdump: symbol table",
+            "type": "shell",
+            "command": "cargo objdump --release -- --syms",
+            "problemMatcher": []
+        },
+        {
+            "label": "cargo nm: list symbols by size",
+            "type": "shell",
+            "command": "cargo nm --release -- --size-sort --print-size",
+            "problemMatcher": []
+        },
+        {
+            "label": "cargo readobj: file headers",
+            "type": "shell",
+            "command": "cargo readobj --release -- --file-headers",
+            "problemMatcher": []
+        },
+        {
+            "label": "elf2uf2: convert to UF2",
+            "type": "shell",
+            "command": "elf2uf2-rs target/thumbv6m-none-eabi/release/atome_lm_rs target/atome_lm_rs.uf2",
+            "dependsOn": "cargo: build (release)",
+            "problemMatcher": []
+        },
+        {
+            "label": "cargo: clean",
+            "type": "shell",
+            "command": "cargo clean",
+            "problemMatcher": []
+        }
+    ],
+    "inputs": [
+        {
+            "id": "embassyExample",
+            "description": "Embassy example name",
+            "type": "pickString",
+            "options": [
+                "embassy_blinky",
+                "embassy_button",
+                "embassy_multitask"
+            ],
+            "default": "embassy_blinky"
+        }
+    ]
+}

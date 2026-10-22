@@ -1,0 +1,20 @@
+{
+    "name": "atome_lm_rs",
+    "build": {
+        "dockerfile": "../.docker/Dockerfile"
+    },
+    "workspaceMount": "source=${localWorkspaceFolder},target=/atome_lm_rs,type=bind",
+    "workspaceFolder": "/atome_lm_rs",
+    "remoteUser": "vscode",
+    "updateRemoteUserUID": true,
+    "customizations": {
+        "vscode": {
+            "extensions": [
+                "rust-lang.rust-analyzer",
+                "baker-link-lab.baker-link-env",
+                "tamasfe.even-better-toml",
+                "fill-labs.dependi"
+            ]
+        }
+    }
+}
