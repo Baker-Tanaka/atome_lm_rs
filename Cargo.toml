@@ -6,8 +6,9 @@ edition = "2021"
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [features]
-default = ["hal-rt"]
+default = ["embassy"]
 hal-rt = ["rp2040-hal/rt"]
+host-tests = []
 embassy = [
     "dep:embassy-executor",
     "dep:embassy-time",
@@ -16,6 +17,11 @@ embassy = [
 ]
 
 [dependencies]
+burn = { version = "=0.21.0", default-features = false, features = ["flex"] }
+burn-flex = { version = "=0.21.0", default-features = false, features = ["critical-section"] }
+
+[target.'cfg(all(target_arch = "arm", target_os = "none"))'.dependencies]
+embedded-alloc = "0.6"
 cortex-m = "0.7"
 cortex-m-rt = "0.7"
 embedded-hal = { version = "1.0.0" }
@@ -38,23 +44,16 @@ embassy-sync = { version = "0.8", features = ["defmt"], optional = true }
 [[bin]]
 name = "atome_lm_rs"
 test = false
+required-features = ["embassy"]
 
 [[test]]
 name = "example_test"
 harness = false
+required-features = ["hal-rt"]
 
-# Embassy examples (require "embassy" feature)
-[[example]]
-name = "embassy_blinky"
-required-features = ["embassy"]
-
-[[example]]
-name = "embassy_button"
-required-features = ["embassy"]
-
-[[example]]
-name = "embassy_multitask"
-required-features = ["embassy"]
+[[test]]
+name = "burn_parity"
+required-features = ["host-tests"]
 
 # cargo build/run
 [profile.dev]
